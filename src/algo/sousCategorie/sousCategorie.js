@@ -1,5 +1,6 @@
 import * as vecter from "#word2vecter";
 import * as tfidf from "#tfidf";
+import { SCORE_MINI_TFIDF } from "#config";
 /*
 
     ***1
@@ -47,7 +48,7 @@ export function combineText(...param) {
 export function supprimerLittleWord(stringData, tabTFIDFscore) {
     let stringTab = stringData.split(" ");
 
-    let tabClean = stringTab.filter(word => (tabTFIDFscore[word] ?? Infinity) >= data.scoreMiniTFIDF);
+    let tabClean = stringTab.filter(word => (tabTFIDFscore[word] ?? Infinity) >= SCORE_MINI_TFIDF);
 
     return tabClean.join(" ");
 }
@@ -58,7 +59,8 @@ export function newDataCat(data, tabTFIDF) {
     let newData = [];
     data.forEach(doc => {
         let text = combineText(doc.desc, doc.title, doc.titleQuizz, doc.questQuizz);
-        newData.push(supprimerLittleWord(text, tabTFIDF));
+        // meme nettoyage que TF_IDF sinon les mots ("Chat," vs "chat") ne correspondent pas aux scores
+        newData.push(supprimerLittleWord(tfidf.cleanText(text), tabTFIDF));
     });
 
     return newData;

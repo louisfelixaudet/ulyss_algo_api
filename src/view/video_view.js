@@ -14,7 +14,7 @@ const videoView = {
     return {
       id: video.id,
       score: video.score,
-      titre: video.titre,
+      titre: video.title,
     };
   },
 

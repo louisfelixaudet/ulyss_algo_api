@@ -68,19 +68,119 @@
 
 import videoModel from "../modele/video_model.js";
 import videoView from "../view/video_view.js";
-import { predict } from "#regressionLineaire";
+import { predict, training as trainingRegression } from "#regressionLineaire";
+import { weightScoreVideo } from "#config";
 import { trainingNeuron } from "#neurone";
 import { resultatsNeurone } from "#connaissance";
-import TF_IDF, { getValueFinal } from "#tfidf";
+import TF_IDF, { getValueFinal, data as dataTFIDF, resetData } from "#tfidf";
 import { combineText, newDataCat, vecterTab, getVideoContext } from "#sousCategorie";
 import { video2Engagement, sortCommentaire } from "#engagement";
+
+// ---------- sous-fonctions d'entrainement (appelees seulement par trainingAlgo) ----------
+
+// tfidf -> word2vecter -> vecteur de chaque video (video2vecter)
+const entrainerSousCat = async () => {
+  const textes = await videoModel.selectAll(["desc", "title", "titleQuizz", "questQuizz"]);
+
+  // TF_IDF reconstruit TF et IDF a chaque appel, la derniere matrice contient tous les documents
+  // on vide d'abord les donnees du dernier entrainement sinon les videos seraient comptees en double
+  resetData();
+  let matriceTFIDF;
+  textes.forEach(doc => {
+    matriceTFIDF = TF_IDF(combineText(doc.desc, doc.title, doc.titleQuizz, doc.questQuizz));
+  });
+
+  await videoModel.pushTF(dataTFIDF.dictWordTF);
+  await videoModel.pushIDF(dataTFIDF.dictWordIDF);
+  await videoModel.pushTFIDF(matriceTFIDF);
+
+  const dataImp = newDataCat(textes, getValueFinal(matriceTFIDF));
+
+  const { W1, index } = vecterTab(dataImp);
+  await videoModel.pushWord2Vect(W1);
+
+  const contextVideo = getVideoContext(dataImp, W1, index);
+  await videoModel.pushContextVideo(contextVideo);
+};
+
+// neurone : nouveaux poids puis axe connaissance
+const entrainerConnaissance = async (nbVideo) => {
+  const oldWeight = await videoModel.selectWeightneurone("training");
+  // { videos: [{ difTeacher, difTeacherOpinion, tauxReussiteQuizz, videoSimResalt }], resp: [...] }
+  const donneesConnaissance = await videoModel.selectDonneesConnaissance();
+
+  if (donneesConnaissance.videos.length !== nbVideo) {
+    throw new Error("connaissance: le nombre de videos ne correspond pas");
+  }
+
+  const xConnaissance = donneesConnaissance.videos.map(video => [
+    video.difTeacher,
+    video.difTeacherOpinion,
+    video.tauxReussiteQuizz,
+    video.videoSimResalt,
+  ]);
+
+  const newWeight = trainingNeuron(xConnaissance, oldWeight.w, oldWeight.b, donneesConnaissance.resp);
+  await videoModel.pushWeightNeurone(newWeight.w, newWeight.b);
+
+  const axeConnaissance = resultatsNeurone(newWeight.w, newWeight.b, donneesConnaissance.videos);
+  await videoModel.pushAxesConnaissance(axeConnaissance);
+};
+
+// knn : note les commentaires sans type puis axe engagement
+const entrainerEngagement = async () => {
+  // allCom: [idVideo, commentaire, type] (type undefined = pas encore note)
+  const allCom = await videoModel.selectCom();
+  const definedCom = allCom.filter(com => com[2] !== undefined);
+
+  const newCom = sortCommentaire(allCom);
+  await videoModel.modifyCommentaires(newCom);
+
+  // knn dans video2Engagement lit [commentaire, type]
+  const comTraining = [...definedCom, ...newCom].map(com => [com[1], com[2]]);
+  const videos = await videoModel.selectAll();
+
+  const axeEngagement = video2Engagement(videos, comTraining);
+  await videoModel.pushAxesEngagement(axeEngagement);
+};
+
+// valeur d'un axe qui manque pour une video
+const AXE_NEUTRE = 0.5;
+
+// score fige d'une video : combinaison fixe de ses 3 axes, ce n'est pas un entrainement
+const scoreFige = ([sousCat, engagement, connaissance]) =>
+  sousCat * weightScoreVideo.SOUSCAT +
+  engagement * weightScoreVideo.ENGAGEMENT +
+  connaissance * weightScoreVideo.CONNAISSANCE;
+
+// regression : apprend a reproduire le score fige a partir des 3 axes (a lancer apres les 3 axes)
+const entrainerRegression = async (nbVideo, lr = 0.5, epoques = 500) => {
+  const [sousCat, engagement, connaissance, oldWeight] = await Promise.all([
+    videoModel.selectSousCat(),
+    videoModel.selectEngagement(),
+    videoModel.selectConnaissance(),
+    videoModel.selectWeightreg("training"),
+  ]);
+
+  // x d'une video = [sousCat, engagement, connaissance] a la meme position i
+  const axe = (tab, i) => (Number.isFinite(tab[i]) ? tab[i] : AXE_NEUTRE);
+  const x = Array.from({ length: nbVideo }, (_, i) => [axe(sousCat, i), axe(engagement, i), axe(connaissance, i)]);
+  const yScoreFige = x.map(scoreFige);
+
+  // premier entrainement : pas encore de poids en bd
+  const a = Array.isArray(oldWeight?.a) && oldWeight.a.length === 3 ? oldWeight.a : [0, 0, 0];
+  const b = oldWeight?.b ?? 0;
+
+  const newWeight = trainingRegression(a, x, b, yScoreFige, lr, epoques);
+  await videoModel.pushWeightReg(newWeight.a, newWeight.b);
+};
 
 const videoControlleur = {
   // precondition: chaque axes doivent avoir la meme longueur
   predictVideo: async (req, res) => {
     try {
 
-      const idUser = req.user?.id;
+      const idUser = req.user?.id || 0;
 
       if (!idUser) {
         return res.status(403).json({ error: "Forbidden" });
@@ -124,68 +224,25 @@ const videoControlleur = {
     }
   },
 
+  // tout est entraine en meme temps sur les nouvelles donnees pour que les axes restent alignes
+  // ordre : sousCat en premier car connaissance lit les vecteurs video2vecter qu'il produit
   trainingAlgo: async (req, res) => {
     try {
 
       // 1. get the number of video
       const nbVideo = (await videoModel.selectAll(["id"])).length;
 
-      // 2. training connaissance (Neurone)
-      const oldWeight = await videoModel.selectWeightneurone("training");
-      // { videos: [{ difTeacher, difTeacherOpinion, tauxReussiteQuizz, videoSimResalt }], resp: [0 | 1] }
-      const donneesConnaissance = await videoModel.selectDonneesConnaissance();
+      // 2. training sousCategorie (word2vecter et tfidf)
+      await entrainerSousCat();
 
-      if (donneesConnaissance.videos.length !== nbVideo) {
-        throw new Error("connaissance: le nombre de videos ne correspond pas");
-      }
-
-      const xConnaissance = donneesConnaissance.videos.map(video => [
-        video.difTeacher,
-        video.difTeacherOpinion,
-        video.tauxReussiteQuizz,
-        video.videoSimResalt,
-      ]);
-
-      const newWeight = trainingNeuron(xConnaissance, oldWeight.w, oldWeight.b, donneesConnaissance.resp);
-      await videoModel.pushWeightNeurone(newWeight.w, newWeight.b);
-
-      const axeConnaissance = resultatsNeurone(newWeight.w, newWeight.b, donneesConnaissance.videos);
-      await videoModel.pushAxesConnaissance(axeConnaissance);
-
-      // 3. training sousCategorie (word2vecter et tfidf)
-      const textes = await videoModel.selectAll(["desc", "title", "titleQuizz", "questQuizz"]);
-
-      // TF_IDF reconstruit TF et IDF a chaque appel, la derniere matrice contient tous les documents
-      let matriceTFIDF;
-      textes.forEach(doc => {
-        matriceTFIDF = TF_IDF(combineText(doc.desc, doc.title, doc.titleQuizz, doc.questQuizz));
-      });
-
-      // TODO: TF et IDF ne sont pas exportes par TF_IDF.js, pushTF et pushIDF a brancher
-      await videoModel.pushTFIDF(matriceTFIDF);
-
-      const dataImp = newDataCat(textes, getValueFinal(matriceTFIDF));
-
-      const { W1, index } = vecterTab(dataImp);
-      await videoModel.pushWord2Vect(W1);
-
-      const contextVideo = getVideoContext(dataImp, W1, index);
-      await videoModel.pushContextVideo(contextVideo);
+      // 3. training connaissance (Neurone)
+      await entrainerConnaissance(nbVideo);
 
       // 4. training engagement (KNN)
-      // allCom: [idVideo, commentaire, type] (type undefined = pas encore note)
-      const allCom = await videoModel.selectCom();
-      const definedCom = allCom.filter(com => com[2] !== undefined);
+      await entrainerEngagement();
 
-      const newCom = sortCommentaire(allCom);
-      await videoModel.modifyCommentaires(newCom);
-
-      // knn dans video2Engagement lit [commentaire, type]
-      const comTraining = [...definedCom, ...newCom].map(com => [com[1], com[2]]);
-      const videos = await videoModel.selectAll();
-
-      const axeEngagement = video2Engagement(videos, comTraining);
-      await videoModel.pushAxesEngagement(axeEngagement);
+      // 5. training regression lineaire (sur le score fige des 3 axes)
+      await entrainerRegression(nbVideo);
 
       return res.json(true);
 

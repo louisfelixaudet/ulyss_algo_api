@@ -45,7 +45,13 @@
 
 */
 
-function cleanText(text) {
+// etat partage : un dictionnaire TF par document + le score IDF de chaque mot
+export const data = {
+    dictWordTF: [],
+    dictWordIDF: {},
+};
+
+export function cleanText(text) {
     return text.replace(/['’]/g, ' ')
         .replace(/[^\p{L}\s]/gu, '')
         .replace(/\s+/g, ' ')
@@ -56,7 +62,7 @@ function cleanText(text) {
 const count = (text, word) => text.filter(item => item === word).length;
 
 // nombre de fois que le mot apparait dans un document
-function TF(text) {
+export function TF(text) {
     let tabWord = text.split(" ");
     let dictTF = {};
 
@@ -86,7 +92,7 @@ function df(t, allDoc) {
     return countWord;
 }
 
-function IDF() {
+export function IDF() {
 
     data.dictWordTF.forEach(doc => {
 
@@ -142,23 +148,21 @@ export default function TF_IDF(text) {
 }
 
 
+// { mot: [score doc0, score doc1, ...] } -> { mot: somme des scores }
 export const getValueFinal = (matriceTFIDF) => {
     let dataValues = {};
-    matriceTFIDF.forEach(word => {
-        let NB = 0;
-        word.forEach(value => {
-            NB += value
-        });
-        dataValues[word] = NB;
+    Object.entries(matriceTFIDF).forEach(([word, scores]) => {
+        dataValues[word] = scores.reduce((somme, value) => somme + value, 0);
     });
     return dataValues;
-} 
+}
 
 
 
 /* ==================== TESTS ==================== */
 
-function resetData() {
+// vide TF et IDF avant un nouvel entrainement
+export function resetData() {
     data.dictWordTF.length = 0;
     Object.keys(data.dictWordIDF).forEach(k => delete data.dictWordIDF[k]);
 }

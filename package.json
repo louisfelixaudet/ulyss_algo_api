@@ -13,6 +13,7 @@
   "imports": {
     "#config": "./src/config/index.js",
     "#routes": "./src/routes/index.js",
+    "#middleware/*": "./src/middleware/*",
     "#word2vecter": "./src/algo/sousCategorie/word2vecter.js",
     "#tfidf": "./src/algo/sousCategorie/TF_IDF.js",
     "#knn": "./src/algo/engagement/fonctionKNN.js",
@@ -21,7 +22,7 @@
     "#connaissance": "./src/algo/connaissance/connaissance.js",
     "#engagement": "./src/algo/engagement/engagement.js",
     "#sousCategorie": "./src/algo/sousCategorie/sousCategorie.js",
-    "#controlleur": "./src/controlleur/*"
+    "#controlleur/*": "./src/controlleur/*"
   },
   "dependencies": {
     "dotenv": "^18.0.10",
