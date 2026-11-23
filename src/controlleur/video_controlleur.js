@@ -180,7 +180,7 @@ const videoControlleur = {
   predictVideo: async (req, res) => {
     try {
 
-      const idUser = req.user?.id || 0;
+      const idUser = res.locals.user?.id || 0;
 
       if (!idUser) {
         return res.status(403).json({ error: "Forbidden" });
@@ -195,7 +195,7 @@ const videoControlleur = {
       const weightReg = await videoModel.selectWeightreg();
 
       // 3. predict the nexte nbNext video
-      const nbNext = Number(req.query.nbNext) || 10;
+      const nbNext = Number(res.locals.video.nb) || 10;
       const videos = await videoModel.selectAll();
       const userRegression = await videoModel.selectUserRegression(idUser);
 
