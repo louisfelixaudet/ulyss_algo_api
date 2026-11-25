@@ -103,7 +103,8 @@ export const weight = mongoose.model('Weight', new mongoose.Schema({
 // date et heure de la derniere requete au serveur pour avoir les videos les plus recentes
 // un seul document pour toute l'api
 export const lastpull = mongoose.model('lastpull', new mongoose.Schema({
-  date: {type: Date, required: true}
+  date: {type: Date, required: true},
+  aEntrainer: {type: Boolean, required: false} // true = des videos recues ne sont pas encore entrainees
 }));
 
 export const prof = mongoose.model('teacher', new mongoose.Schema({

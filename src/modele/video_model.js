@@ -150,6 +150,14 @@
         pushLastPull (date: date de la requete, maintenant par defaut)
     *
 
+    *
+        selectAEntrainer (aucun parametre)
+    *
+
+    *
+        pushAEntrainer (aEntrainer: true ou false)
+    *
+
     garde le commentaire on fait juste les selects pour la premiere session api
 */
 
@@ -535,7 +543,7 @@ const videoModel = {
 
     /*
         relie video + commentaire + quizz dans le format attendu par video2Engagement :
-        [{ like, view, com: [texte, ...], partage, quizz: { repondu, show }, age }]
+        [{ id, like, view, com: [texte, ...], partage, quizz: { repondu, show }, age }]
     */
     selectVideosEngagement: async () => {
         const [videos, coms, statsQuizz] = await Promise.all([
@@ -559,6 +567,7 @@ const videoModel = {
             const ageJours = v.created_at ? (Date.now() - v.created_at.getTime()) / MS_PAR_JOUR : 1;
 
             return {
+                id: v.id,
                 like: v.like ?? 0,
                 view: v.view ?? 0,
                 com: comsVideo.get(v.id) ?? [],
@@ -622,6 +631,19 @@ const videoModel = {
             { upsert: true, new: true }
         );
     },
+
+    // true tant que des videos recues n'ont pas ete entrainees (aussi true si jamais note)
+    selectAEntrainer: async () => {
+        const dernier = await lastpull.findOne().lean();
+        return dernier?.aEntrainer ?? true;
+    },
+
+    // meme document que la date du dernier pull
+    pushAEntrainer: async (aEntrainer) => lastpull.findOneAndUpdate(
+        {},
+        { aEntrainer },
+        { upsert: true, new: true }
+    ),
 
 };
 
