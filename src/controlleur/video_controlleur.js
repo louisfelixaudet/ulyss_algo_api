@@ -64,9 +64,26 @@
           - push the axe
 
     *
+        pullNewVideo (req, res)
+
+        1. get the date of the last pull
+        2. fetch the new videos from api_ulys (newvideo/:date)
+        3. push the videos, the comments and the quizz
+        4. update the metadata of all the videos (meta)
+        5. hide the videos deleted or private (syncVisibility)
+        6. push the date of this pull
+        7. training
+
+    *
+        syncVideo (req, res)
+
+        1. fetch the id of the visible videos from api_ulys (visibles)
+        2. hide the others: not predicted but still used for the training
+
+    *
 */
 
-import videoModel from "../modele/video_model.js";
+import videoModel, { valeurAxe } from "../modele/video_model.js";
 import videoView from "../view/video_view.js";
 import { predict, training as trainingRegression } from "#regressionLineaire";
 import { weightScoreVideo } from "#config";
@@ -76,7 +93,7 @@ import TF_IDF, { getValueFinal, data as dataTFIDF, resetData } from "#tfidf";
 import { combineText, newDataCat, vecterTab, getVideoContext } from "#sousCategorie";
 import { video2Engagement, sortCommentaire } from "#engagement";
 
-// ---------- sous-fonctions d'entrainement (appelees seulement par trainingAlgo) ----------
+// ---------- sous-fonctions d'entrainement (appelees seulement par entrainerTout) ----------
 
 // tfidf -> word2vecter -> vecteur de chaque video (video2vecter)
 const entrainerSousCat = async () => {
@@ -97,6 +114,10 @@ const entrainerSousCat = async () => {
   const dataImp = newDataCat(textes, getValueFinal(matriceTFIDF));
 
   const { W1, index } = vecterTab(dataImp);
+
+  // pas assez de textes : aucun mot n'est assez frequent pour avoir un vecteur
+  if (W1.length === 0) return;
+
   await videoModel.pushWord2Vect(W1);
 
   const contextVideo = getVideoContext(dataImp, W1, index);
@@ -120,7 +141,11 @@ const entrainerConnaissance = async (nbVideo) => {
     video.videoSimResalt,
   ]);
 
-  const newWeight = trainingNeuron(xConnaissance, oldWeight.w, oldWeight.b, donneesConnaissance.resp);
+  // premier entrainement : pas encore de poids en bd (un poids par entree)
+  const w = oldWeight?.w?.length === 4 ? oldWeight.w : [0, 0, 0, 0];
+  const b = oldWeight?.b ?? 0;
+
+  const newWeight = trainingNeuron(xConnaissance, w, b, donneesConnaissance.resp);
   await videoModel.pushWeightNeurone(newWeight.w, newWeight.b);
 
   const axeConnaissance = resultatsNeurone(newWeight.w, newWeight.b, donneesConnaissance.videos);
@@ -129,23 +154,27 @@ const entrainerConnaissance = async (nbVideo) => {
 
 // knn : note les commentaires sans type puis axe engagement
 const entrainerEngagement = async () => {
-  // allCom: [idVideo, commentaire, type] (type undefined = pas encore note)
+  // allCom: [idVideo, commentaire, note, idcom] (note undefined = pas encore note)
   const allCom = await videoModel.selectCom();
   const definedCom = allCom.filter(com => com[2] !== undefined);
+  const undefinedCom = allCom.filter(com => com[2] === undefined);
 
-  const newCom = sortCommentaire(allCom);
-  await videoModel.modifyCommentaires(newCom);
+  // sortCommentaire garde l'ordre de undefinedCom (note null = aucun commentaire note pour comparer)
+  const newCom = sortCommentaire(allCom)
+    .map(([idVideo, texte, note], i) => [idVideo, texte, note, undefinedCom[i][3]])
+    .filter(com => com[2] !== null);
+
+  await Promise.all(newCom.map(([idVideo, , note, idcom]) =>
+    videoModel.modifyTypeCommentaires(idcom, idVideo, note === 1 ? "positif" : "negatif")
+  ));
 
   // knn dans video2Engagement lit [commentaire, type]
   const comTraining = [...definedCom, ...newCom].map(com => [com[1], com[2]]);
-  const videos = await videoModel.selectAll();
+  const videos = await videoModel.selectVideosEngagement();
 
   const axeEngagement = video2Engagement(videos, comTraining);
   await videoModel.pushAxesEngagement(axeEngagement);
 };
-
-// valeur d'un axe qui manque pour une video
-const AXE_NEUTRE = 0.5;
 
 // score fige d'une video : combinaison fixe de ses 3 axes, ce n'est pas un entrainement
 const scoreFige = ([sousCat, engagement, connaissance]) =>
@@ -163,8 +192,7 @@ const entrainerRegression = async (nbVideo, lr = 0.5, epoques = 500) => {
   ]);
 
   // x d'une video = [sousCat, engagement, connaissance] a la meme position i
-  const axe = (tab, i) => (Number.isFinite(tab[i]) ? tab[i] : AXE_NEUTRE);
-  const x = Array.from({ length: nbVideo }, (_, i) => [axe(sousCat, i), axe(engagement, i), axe(connaissance, i)]);
+  const x = Array.from({ length: nbVideo }, (_, i) => [valeurAxe(sousCat, i), valeurAxe(engagement, i), valeurAxe(connaissance, i)]);
   const yScoreFige = x.map(scoreFige);
 
   // premier entrainement : pas encore de poids en bd
@@ -173,6 +201,142 @@ const entrainerRegression = async (nbVideo, lr = 0.5, epoques = 500) => {
 
   const newWeight = trainingRegression(a, x, b, yScoreFige, lr, epoques);
   await videoModel.pushWeightReg(newWeight.a, newWeight.b);
+};
+
+// un seul entrainement a la fois : TF_IDF garde ses donnees dans un etat partage
+let entrainementEnCours = false;
+
+// tout est entraine en meme temps sur les nouvelles donnees pour que les axes restent alignes
+// ordre : sousCat en premier car connaissance lit les vecteurs video2vecter qu'il produit
+const entrainerTout = async () => {
+  if (entrainementEnCours) throw new Error("un entrainement est deja en cours");
+  entrainementEnCours = true;
+
+  try {
+
+    // 1. get the number of video
+    const nbVideo = (await videoModel.selectAll(["id"])).length;
+    if (nbVideo === 0) throw new Error("aucune video pour l'entrainement");
+
+    // 2. training sousCategorie (word2vecter et tfidf)
+    await entrainerSousCat();
+
+    // 3. training connaissance (Neurone)
+    await entrainerConnaissance(nbVideo);
+
+    // 4. training engagement (KNN)
+    await entrainerEngagement();
+
+    // 5. training regression lineaire (sur le score fige des 3 axes)
+    await entrainerRegression(nbVideo);
+
+    // 6. tout a reussi : la prediction utilise les nouveaux poids
+    await videoModel.pushWeightPrediction();
+
+  } finally {
+    entrainementEnCours = false;
+  }
+};
+
+// ---------- sous-fonctions du pull et de la synchronisation avec api_ulys ----------
+
+const ULYS_API_URL = process.env.ULYS_API_URL ?? "http://localhost:3001/api/videos";
+const TIMEOUT_ULYS = 10000; // ms
+
+// GET sur api_ulys, la reponse doit etre une liste
+const fetchListe = async (chemin) => {
+  const reponse = await fetch(`${ULYS_API_URL}${chemin}`, {
+    signal: AbortSignal.timeout(TIMEOUT_ULYS),
+  });
+
+  if (!reponse.ok) throw new Error(`api_ulys a repondu ${reponse.status}`);
+
+  const liste = await reponse.json();
+  if (!Array.isArray(liste)) throw new Error("api_ulys doit renvoyer une liste");
+
+  return liste;
+};
+
+const fetchNewVideo = (date) => fetchListe(`/newvideo/${encodeURIComponent(date.toISOString())}`);
+
+// cache les videos supprimees ou privees, remontre celles qui sont de nouveau publiques
+const faireSync = async () => {
+  const idsVisibles = await fetchListe("/visibles");
+  if (!idsVisibles.every(Number.isInteger)) throw new Error("api_ulys doit renvoyer une liste d'id");
+
+  await videoModel.syncVisibility(idsVisibles);
+};
+
+// une synchronisation a la fois : une vieille liste ne doit pas s'ecrire par-dessus une plus recente
+let derniereSync = Promise.resolve();
+
+export const syncVisibilite = () => {
+  derniereSync = derniereSync.catch(() => {}).then(faireSync);
+  return derniereSync;
+};
+
+// commentaires de api_ulys -> format de pushCommentaires
+const comsUlys = (comments) => (comments ?? []).map(com => ({
+  idcom: com.id_comment,
+  iduser: com.id_user,
+  commentaire: com.content,
+}));
+
+// compteurs, resultats des quizz et commentaires a jour de toutes les videos
+const faireMeta = async () => {
+  const metas = await fetchListe("/meta");
+
+  await videoModel.pushMeta(metas.map(m => ({
+    id: m.id_video,
+    view: Number(m.view_count ?? 0),
+    like: Number(m.like_count ?? 0),
+    com: Number(m.comment_count ?? 0),
+    partage: Number(m.share_count ?? 0),
+    tauxReussite: m.taux_reussite ?? null,
+    questions: (m.questions ?? []).map(q => ({
+      idquestion: q.id_question,
+      montrer: q.montrer,
+      repondu: q.repondu,
+    })),
+  })));
+
+  for (const m of metas) {
+    await videoModel.pushCommentaires(m.id_video, comsUlys(m.comments));
+  }
+};
+
+// video de api_ulys -> bd (meme format que GET /api/videos : compteurs + comments + quiz)
+const pushVideoUlys = async (v) => {
+  const questions = v.quiz?.questions ?? [];
+
+  await videoModel.pushVideo({
+    id: v.id_video,
+    titre: v.title,
+    description: v.caption ?? "",
+    titreQuizz: v.quiz?.title ?? "",
+    questionQuizz: questions.map(q => q.question_text).join(" "),
+    categorie: v.id_category ?? undefined,
+    like: Number(v.like_count ?? 0),
+    view: Number(v.view_count ?? 0),
+    com: Number(v.comment_count ?? 0),
+    partage: Number(v.share_count ?? 0),
+    idteacher: v.id_user,
+    created_at: v.created_at,
+    visibility: Boolean(v.visibility ?? true),
+  });
+
+  await videoModel.pushCommentaires(v.id_video, comsUlys(v.comments));
+
+  if (v.quiz) {
+    await videoModel.pushQuizz(v.id_video, v.quiz.id_quiz, questions.map(q => ({
+      idquestion: q.id_question,
+      question: {
+        question: q.question_text,
+        ...Object.fromEntries((q.options ?? []).map(o => [String(o.id_option), o.option_text])),
+      },
+      response: (q.options ?? []).find(o => o.is_correct)?.id_option ?? 0,
+    })));
+  }
 };
 
 const videoControlleur = {
@@ -194,10 +358,14 @@ const videoControlleur = {
       // 2. get the weight of regression lineaire
       const weightReg = await videoModel.selectWeightreg();
 
+      if (!weightReg) {
+        return res.status(503).json({ error: "le modele n'est pas encore entraine" });
+      }
+
       // 3. predict the nexte nbNext video
       const nbNext = Number(res.locals.video.nb) || 10;
       const videos = await videoModel.selectAll();
-      const userRegression = await videoModel.selectUserRegression(idUser);
+      const userRegression = await videoModel.selectUserRegression(idUser, res.locals.user.likes);
 
       // x d'une video = [sousCat, engagement, connaissance] a la meme position i
       const videosPredites = videos
@@ -205,11 +373,13 @@ const videoControlleur = {
           ...video,
           score: predict(
             weightReg.a,
-            [vecSousCat[i], vecEngagement[i], vecConnaissance[i]],
+            [valeurAxe(vecSousCat, i), valeurAxe(vecEngagement, i), valeurAxe(vecConnaissance, i)],
             weightReg.b
           ),
         }))
         .sort((v1, v2) => Math.abs(v1.score - userRegression) - Math.abs(v2.score - userRegression))
+        // seulement apres le map : la position i doit rester celle des axes
+        .filter(video => video.visibility !== false)
         .slice(0, nbNext);
 
       // 4. send the all the video predicted with the videoView
@@ -224,31 +394,80 @@ const videoControlleur = {
     }
   },
 
-  // tout est entraine en meme temps sur les nouvelles donnees pour que les axes restent alignes
-  // ordre : sousCat en premier car connaissance lit les vecteurs video2vecter qu'il produit
   trainingAlgo: async (req, res) => {
     try {
 
-      // 1. get the number of video
-      const nbVideo = (await videoModel.selectAll(["id"])).length;
-
-      // 2. training sousCategorie (word2vecter et tfidf)
-      await entrainerSousCat();
-
-      // 3. training connaissance (Neurone)
-      await entrainerConnaissance(nbVideo);
-
-      // 4. training engagement (KNN)
-      await entrainerEngagement();
-
-      // 5. training regression lineaire (sur le score fige des 3 axes)
-      await entrainerRegression(nbVideo);
+      await entrainerTout();
 
       return res.json(true);
 
     } catch (err) {
 
       return res.status(500).json({ error: err.message });
+
+    }
+  },
+
+  // va chercher les nouvelles videos de api_ulys puis entraine le modele
+  pullNewVideo: async (req, res) => {
+    let nbAjout = 0;
+
+    try {
+
+      // 1. get the date of the last pull (premiere fois : toutes les videos)
+      // date prise avant le fetch et a la seconde pres (precision des dates MySQL) pour ne manquer aucune video
+      const debut = new Date();
+      debut.setMilliseconds(0);
+      const dernierPull = (await videoModel.selectLastPull()) ?? new Date(0);
+
+      // 2. fetch the new videos
+      let videos;
+      try {
+        videos = await fetchNewVideo(dernierPull);
+      } catch (err) {
+        return res.status(502).json({ error: `api_ulys: ${err.message}` });
+      }
+
+      // 3. push the videos, the comments and the quizz
+      for (const v of videos) {
+        await pushVideoUlys(v);
+        nbAjout++;
+      }
+
+      // 4. et 5. metadonnees a jour puis videos cachees (apres le push : une video a pu changer pendant le pull)
+      try {
+        await faireMeta();
+        await syncVisibilite();
+      } catch (err) {
+        return res.status(502).json({ error: `api_ulys: ${err.message}`, nbVideo: nbAjout });
+      }
+
+      // 6. push the date, seulement si toutes les videos sont en bd
+      await videoModel.pushLastPull(debut);
+
+      // 7. training, seulement s'il y a du nouveau
+      if (nbAjout > 0) await entrainerTout();
+
+      return res.json({ nbVideo: nbAjout, entraine: nbAjout > 0 });
+
+    } catch (err) {
+
+      return res.status(500).json({ error: err.message, nbVideo: nbAjout });
+
+    }
+  },
+
+  // appele par api_ulys quand une video est supprimee, cachee ou remontree
+  syncVideo: async (req, res) => {
+    try {
+
+      await syncVisibilite();
+
+      return res.json(true);
+
+    } catch (err) {
+
+      return res.status(502).json({ error: `api_ulys: ${err.message}` });
 
     }
   },

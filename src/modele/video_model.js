@@ -59,7 +59,7 @@
         selectSousCat (aucun parametre) 
     *    
     *
-        selectUserRegression (idUser)
+        selectUserRegression (idUser, idsLikes: id des videos likees)
     *
 
     *
@@ -95,7 +95,31 @@
     *
     
     *
-        pushVideo (titre, description, titreQuizz, questionQuizz, like, view, comPos, comNeg, partage, nbQuizzRepondu, nbQuizzMontrer, age)
+        pushVideo (id, titre, description, titreQuizz, questionQuizz, categorie, like, view, com, partage, idteacher, created_at, visibility)
+    *
+
+    *
+        pushCommentaires (idvideo, coms)
+    *
+
+    *
+        pushQuizz (idvideo, idquizz, questions)
+    *
+
+    *
+        selectVideosEngagement (aucun parametre)
+    *
+
+    *
+        pushWeightPrediction (aucun parametre)
+    *
+
+    *
+        syncVisibility (idsVisibles)
+    *
+
+    *
+        pushMeta (metas)
     *
 
     *
@@ -118,10 +142,18 @@
         modifyCommentaires (commentaires)
     *
 
+    *
+        selectLastPull (aucun parametre)
+    *
+
+    *
+        pushLastPull (date: date de la requete, maintenant par defaut)
+    *
+
     garde le commentaire on fait juste les selects pour la premiere session api
 */
 
-import { axes, commentaire, idf, prof, quizz, tf, tfidf, video, video2vecter, weight, word2vecter } from "../config/constants.js";
+import { axes, commentaire, idf, lastpull, prof, quizz, tf, tfidf, video, video2vecter, weight, word2vecter } from "../config/constants.js";
 import { cosinus } from "#sousCategorie";
 import { burnValue2Sigmoide } from "#engagement";
 import { predict } from "#regressionLineaire";
@@ -147,7 +179,19 @@ const videosSimilaires = (i, vecteurs) => {
         .map(v => v.j);
 };
 
+// type en bd -> note du knn
+const noteCom = (type) => {
+    if (type === undefined || type === null) return undefined;
+    return TYPES_COM_POSITIF.includes(type) ? 1 : 0;
+};
+
+const MS_PAR_JOUR = 24 * 60 * 60 * 1000;
+
 const moyenne = (tab) => tab.reduce((s, v) => s + v, 0) / tab.length;
+
+// valeur de l'axe a la position i, VALEUR_NEUTRE si elle manque
+// l'entrainement et la prediction doivent remplacer une valeur manquante de la meme facon
+export const valeurAxe = (tab, i) => (Number.isFinite(tab[i]) ? tab[i] : VALEUR_NEUTRE);
 
 // renvoie le tableau data d'un axe ([] si l'axe n'existe pas encore)
 const selectAxe = async (axe_name) => {
@@ -184,17 +228,18 @@ const videoModel = {
 
     selectVectvideo: async () => video2vecter.find({}).sort({ idvideo: 1 }),
 
-    // format attendu par le controlleur : [idVideo, commentaire, type]
+    // format attendu par le controlleur : [idVideo, commentaire, note, idcom]
+    // note : 1 = positif, 0 = negatif, undefined = pas encore note
     selectCom: async () => {
         const coms = await commentaire.find({}).lean();
-        return coms.map(com => [com.idvideo, com.commentaire, com.type]);
+        return coms.map(com => [com.idvideo, com.commentaire, noteCom(com.type), com.idcom]);
     },
 
     // tous les commentaires d'une video
     // seulement les vrais commentaires (pas ceux d'entrainement)
     selectComById: async (id) => commentaire.find({ idvideo: id, test: { $ne: true } }).lean(),
 
-    selectAll: async (colonnes = []) => await video.find().select(colonnes.join(" ")).sort({ id: 1 }),
+    selectAll: async (colonnes = []) => video.find().select(colonnes.join(" ")).sort({ id: 1 }).lean(),
 
     selectByid: async (id) => video.findById(id),
 
@@ -208,14 +253,14 @@ const videoModel = {
 
     /*
         score cible du client = moyenne du score de regression des videos qu'il a aimees
-        (aimee = il a laisse un vrai commentaire positif dessus)
+        (aimee = il l'a likee ou a laisse un vrai commentaire positif dessus)
 
         nouveau client (rien aime) : moyenne de toutes les videos
         pas encore de poids de regression : VALEUR_NEUTRE
 
         la position i = video i triee par id dans les 3 axes
     */
-    selectUserRegression: async (idUser) => {
+    selectUserRegression: async (idUser, idsLikes = []) => {
         const id = Number(idUser);
         if (!Number.isInteger(id)) {
             throw new Error(`selectUserRegression: idUser invalide (recu: ${idUser})`);
@@ -233,11 +278,15 @@ const videoModel = {
         // predict attend une pente par axe
         if (!weightReg || !Array.isArray(weightReg.a)) return VALEUR_NEUTRE;
 
-        const scoreVideo = (i) => predict(weightReg.a, [sousCat[i], engagement[i], connaissance[i]], weightReg.b);
+        const scoreVideo = (i) => predict(
+            weightReg.a,
+            [valeurAxe(sousCat, i), valeurAxe(engagement, i), valeurAxe(connaissance, i)],
+            weightReg.b
+        );
 
         // id de video -> position dans les axes
         const position = new Map(videos.map((v, i) => [v.id, i]));
-        const idsAimes = new Set(comsAimes.map(com => com.idvideo));
+        const idsAimes = new Set([...comsAimes.map(com => com.idvideo), ...idsLikes]);
 
         let indices = [...idsAimes].map(idVideo => position.get(idVideo)).filter(i => i !== undefined);
         if (indices.length === 0) indices = videos.map((v, i) => i);
@@ -298,49 +347,123 @@ const videoModel = {
         }))
     ),
 
+    // id = id_video de api_ulys : une video deja recue est mise a jour, pas creee en double
     pushVideo: async ({
+        id,
         titre,
         description = "",
         titreQuizz = "",
         questionQuizz = "",
+        categorie,
         like = 0,
         view = 0,
         com = 0,
         partage = 0,
-        nbQuizzRepondu = 0,
-        nbQuizzMontrer = 0,
-        age = 0, // en jours
+        idteacher,
+        created_at,
+        visibility = true,
     } = {}) => {
-        if (typeof titre !== "string" || titre.trim() === "") {
-            throw new Error("pushVideo: titre est obligatoire");
+        if (!Number.isInteger(id) || id <= 0) {
+            throw new Error(`pushVideo: id invalide (recu: ${id})`);
         }
 
-        const compteurs = { like, view, comPos, comNeg, partage, nbQuizzRepondu, nbQuizzMontrer, age };
-        Object.entries(compteurs).forEach(([nom, valeur]) => {
+        if (typeof titre !== "string" || titre.trim() === "") {
+            throw new Error(`pushVideo: titre est obligatoire (video ${id})`);
+        }
+
+        Object.entries({ like, view, com, partage }).forEach(([nom, valeur]) => {
             if (!Number.isFinite(valeur) || valeur < 0) {
-                throw new Error(`pushVideo: ${nom} doit etre un nombre positif (recu: ${valeur})`);
+                throw new Error(`pushVideo: ${nom} doit etre un nombre positif (video ${id}, recu: ${valeur})`);
             }
         });
 
-        // id auto-incremente : le plus grand id existant + 1
-        const derniere = await video.findOne().sort({ id: -1 }).select("id").lean();
-        const id = (derniere?.id ?? 0) + 1;
-
-        // TODO: comPos, comNeg, nbQuizzRepondu et nbQuizzMontrer n'ont pas de champ
-        // dans le schema video, mongoose les ignorerait. a ajouter au schema si besoin
-        return video.create({
-            id,
-            title: titre.trim(),
-            desc: description,
-            titleQuizz: titreQuizz,
-            questQuizz: questionQuizz,
-            like,
-            view,
-            comment: com,
-            share: partage,
-            created_at: new Date(Date.now() - age * 24 * 60 * 60 * 1000),
-        });
+        return video.findOneAndUpdate(
+            { id },
+            {
+                title: titre.trim(),
+                desc: description,
+                titleQuizz: titreQuizz,
+                questQuizz: questionQuizz,
+                categorie,
+                like,
+                view,
+                comment: com,
+                share: partage,
+                idteacher,
+                created_at,
+                visibility,
+            },
+            { upsert: true, new: true }
+        );
     },
+
+    // coms = [{ idcom, iduser, commentaire }, ...]
+    // le type n'est pas touche : un commentaire deja note par le knn garde sa note
+    pushCommentaires: async (idvideo, coms) => {
+        if (coms.length === 0) return null;
+
+        return commentaire.bulkWrite(
+            coms.map(({ idcom, iduser, commentaire: texte }) => ({
+                updateOne: {
+                    filter: { idcom, idvideo },
+                    update: { iduser, commentaire: texte },
+                    upsert: true,
+                },
+            }))
+        );
+    },
+
+    // questions = [{ idquestion, question: { question: texte, idOption: texteOption }, response }, ...]
+    // montrer et repondu commencent a 0 et ne sont pas remis a 0 ensuite
+    pushQuizz: async (idvideo, idquizz, questions) => {
+        if (questions.length === 0) return null;
+
+        return quizz.bulkWrite(
+            questions.map(({ idquestion, question, response }) => ({
+                updateOne: {
+                    filter: { idvideo, idquizz, idquestion },
+                    update: { $set: { question, response }, $setOnInsert: { montrer: 0, repondu: 0 } },
+                    upsert: true,
+                },
+            }))
+        );
+    },
+
+    /*
+        met a jour les videos deja recues (aucune video n'est creee) :
+        metas = [{ id, view, like, com, partage, tauxReussite (null = aucune reponse), questions: [{ idquestion, montrer, repondu }] }]
+    */
+    pushMeta: async (metas) => {
+        const majVideos = metas.map(({ id, view, like, com, partage, tauxReussite }) => ({
+            updateOne: {
+                filter: { id },
+                update: {
+                    view,
+                    like,
+                    comment: com,
+                    share: partage,
+                    ...(tauxReussite === null ? {} : { tauxReussiteQuizz: tauxReussite }),
+                },
+            },
+        }));
+
+        const majQuizz = metas.flatMap(({ id, questions }) => questions.map(({ idquestion, montrer, repondu }) => ({
+            updateOne: {
+                filter: { idvideo: id, idquestion },
+                update: { montrer, repondu },
+            },
+        })));
+
+        if (majVideos.length > 0) await video.bulkWrite(majVideos);
+        if (majQuizz.length > 0) await quizz.bulkWrite(majQuizz);
+    },
+
+    // visible = dans la liste, les autres sont cachees (supprimees ou privees)
+    // rien n'est efface : une video cachee sert encore a l'entrainement
+    syncVisibility: async (idsVisibles) => Promise.all([
+        video.updateMany({ id: { $in: idsVisibles } }, { visibility: true }),
+        video.updateMany({ id: { $nin: idsVisibles } }, { visibility: false }),
+    ]),
 
     pushContextVideo: async (contextvideo) => video2vecter.bulkWrite(
         contextvideo.map((vecteur, idvideo) => ({
@@ -410,6 +533,54 @@ const videoModel = {
         };
     },
 
+    /*
+        relie video + commentaire + quizz dans le format attendu par video2Engagement :
+        [{ like, view, com: [texte, ...], partage, quizz: { repondu, show }, age }]
+    */
+    selectVideosEngagement: async () => {
+        const [videos, coms, statsQuizz] = await Promise.all([
+            video.find().sort({ id: 1 }).lean(),
+            commentaire.find({ test: { $ne: true } }).select("idvideo commentaire").lean(),
+            quizz.aggregate([
+                { $match: { test: { $ne: true } } },
+                { $group: { _id: "$idvideo", repondu: { $sum: "$repondu" }, montrer: { $sum: "$montrer" } } },
+            ]),
+        ]);
+
+        const comsVideo = new Map();
+        coms.forEach(com => {
+            if (!comsVideo.has(com.idvideo)) comsVideo.set(com.idvideo, []);
+            comsVideo.get(com.idvideo).push(com.commentaire);
+        });
+        const quizzVideo = new Map(statsQuizz.map(q => [q._id, q]));
+
+        return videos.map(v => {
+            const stats = quizzVideo.get(v.id);
+            const ageJours = v.created_at ? (Date.now() - v.created_at.getTime()) / MS_PAR_JOUR : 1;
+
+            return {
+                like: v.like ?? 0,
+                view: v.view ?? 0,
+                com: comsVideo.get(v.id) ?? [],
+                partage: v.share ?? 0,
+                // minimum 1 : l'engagement divise par show et par age
+                quizz: { repondu: stats?.repondu ?? 0, show: Math.max(1, stats?.montrer ?? 0) },
+                age: Math.max(1, ageJours),
+            };
+        });
+    },
+
+    // copie les poids entraines vers ceux que la prediction utilise
+    pushWeightPrediction: async () => {
+        const poids = await weight.find({ type: 'training' }).lean();
+
+        return Promise.all(poids.map(({ algo, w, a, b }) => weight.findOneAndUpdate(
+            { algo, type: 'prediction' },
+            { w, a, b },
+            { upsert: true, new: true }
+        )));
+    },
+
     // TFIDF = { mot: [score doc0, score doc1, ...] } : le mot sert de cle
     pushTFIDF: async (TFIDF) => tfidf.bulkWrite(
         Object.entries(TFIDF).map(([word, scoreTFIDF]) => ({
@@ -432,6 +603,25 @@ const videoModel = {
     ),
 
     modifyVideo: async (id, parametres = {}) => video.findByIdAndUpdate(id, parametres, { new: true }),
+
+    // date de la derniere requete (null si aucune requete n'a encore ete faite)
+    selectLastPull: async () => {
+        const dernier = await lastpull.findOne().lean();
+        return dernier?.date ?? null;
+    },
+
+    // remplace la date de la derniere requete (filtre vide = toujours le meme document, cree la premiere fois)
+    pushLastPull: async (date = new Date()) => {
+        if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+            throw new Error(`pushLastPull: date invalide (recu: ${date})`);
+        }
+
+        return lastpull.findOneAndUpdate(
+            {},
+            { date },
+            { upsert: true, new: true }
+        );
+    },
 
 };
 

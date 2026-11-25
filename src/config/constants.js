@@ -45,8 +45,9 @@ export const video = mongoose.model('Video', new mongoose.Schema({
 export const quizz = mongoose.model('quizz', new mongoose.Schema({
   idvideo: {type: Number, required: true},
   idquizz: {type: Number, required: true},
+  idquestion: {type: Number, required: false}, // id_question de api_ulys (un document par question)
   question: {type: Map, of: String, required: true},
-  response: {type: Number, required: true}, // id bonne reponse
+  response: {type: Number, required: true}, // id bonne reponse (0 = question a reponse libre)
   montrer: {type: Number, required: true},
   repondu: {type: Number, required: true},
   test: {type: Boolean, default: false} // true = donnee seulement pour l'entrainement, pas un vrai quizz de video
@@ -81,7 +82,7 @@ export const commentaire = mongoose.model('commentaire', new mongoose.Schema({
   idcom: {type: Number, required: true},
   idvideo: {type: Number, required: true},
   iduser: {type: Number, required: true},
-  type: {type: String, required: true}, // positif negatif
+  type: {type: String, required: false}, // positif negatif (vide = pas encore note par le knn)
   commentaire: {type: String, required: true},
   test: {type: Boolean, default: false}, // true = donnee seulement pour l'entrainement, pas un vrai commentaire de video
 }));
@@ -98,6 +99,12 @@ export const weight = mongoose.model('Weight', new mongoose.Schema({
   a: {type: [Number], required: false},   // regression : une pente par axe (sousCat, engagement, connaissance)
   b: {type: Number, required: true}       // biais (neurone) ou ordonnee (regression)
 }).index({algo: 1, type: 1}, {unique: true}));
+
+// date et heure de la derniere requete au serveur pour avoir les videos les plus recentes
+// un seul document pour toute l'api
+export const lastpull = mongoose.model('lastpull', new mongoose.Schema({
+  date: {type: Date, required: true}
+}));
 
 export const prof = mongoose.model('teacher', new mongoose.Schema({
   idteacher: {type: Number, required: true, unique: true},

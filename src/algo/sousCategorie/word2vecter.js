@@ -190,6 +190,10 @@ export function step(wordv, voisin, negatifs, taux) {
 export function getNegatif(centre, voisins, N, k) {
     let negatifs = [];
     let r = 0;
+
+    // tous les mots sont des voisins : aucun negatif possible, la boucle ne finirait jamais
+    if (new Set([...voisins, centre]).size >= N) return negatifs;
+
     for (let i = 0; negatifs.length < k; i++) {
         r = Math.floor(getRandomInt(0, N));
         if (centre !== r && !(voisins.has(r))) {
